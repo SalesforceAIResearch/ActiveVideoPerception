@@ -1,48 +1,37 @@
 """
-Agentic Video Understanding Framework (Gemini API) — Plan-Observe-Reflect Implementation
-========================================================================================
+Active Video Perception (AVP) — Plan-Observe-Reflect implementation
+===================================================================
 
-This module implements a single-action plan → observe → verification loop for video understanding.
-Given a query Q and a long video V, the framework runs an iterative process:
+Single-action plan -> observe -> reflect loop for long-video understanding,
+following Algorithm 1 of the paper. Given a query Q and a video V, AVP runs:
 
-1. Plan (single observation action):
-   - The Planner drafts one observation configuration for this round (no multi-step):
+1. Plan (one observation action per round):
+   - The Planner drafts one observation configuration this round:
      - load_mode: "uniform" (full video) or "region" (specific time span[s])
-     - fps: sampling rate
-     - spatial resolution: low/medium
-   - The sub_query equals the original query (including options if provided).
+     - fps: sampling rate; spatial_token_rate: "low" or "medium"
+   - The sub_query equals the original query (including MCQ options if any).
 
 2. Observe:
-   - The Observer watches the video using the planned configuration and the query,
-     feeds the video directly to the model, and collects a query-related evidence list.
-   - Evidence is a list of timestamp ranges with descriptions, normalized to full seconds.
+   - The Observer executes the planned observation and extracts query-relevant
+     evidence as timestamped intervals with descriptions (the structured
+     evidence list E).
 
-3. Verification (decision):
-   - The verifier re-watches the specific evidence regions (cropped clips or offsets)
-     to confirm correctness and sufficiency to answer the query.
-   - If evidence is sufficient: synthesize the final answer.
-   - If insufficient: return a justification and loop back to the Planner with the
-     current evidence list and full interaction history to draft a new observation.
+3. Reflect:
+   - The Reflector (an MLLM) verifies the cumulative evidence against the query
+     and jointly emits (confidence in [0,1], justification, reasoning).
+   - If `confidence >= tau_conf` (paper Sec 4.3 default 0.7) AND the reflector's
+     own `sufficient` flag is true, EXTRACTANSWER pulls the answer from the
+     justification; otherwise the justification is fed to the next REPLAN(Q,H,J).
+   - On the final round, FORCEANSWER synthesizes from all accumulated evidence.
 
-The framework leverages Gemini's native video understanding capabilities:
-videos are passed directly to the API with metadata (fps, time ranges, resolution)
-rather than extracting individual frames.
+Videos are passed to Gemini directly: small clips inline, larger files via the
+Gemini File API (avoids the 2 GiB inline cap and 1 GiB request-payload cap).
 
-Video metadata (duration, fps) is loaded from JSON dataset files rather than
-extracting from video files, eliminating codec dependencies and improving speed.
+CLI entry point:
+  python -m avp.eval_dataset --ann ANNOTATION.json --out OUT --config CONFIG \
+                             --max-turns 3 --confidence-threshold 0.7
 
-External deps: `google-genai` (Gemini SDK) and `tqdm` (optional).
-No OpenCV or video codec dependencies required!
-
-CLI subcommands:
-  - `plan`          : Create initial plan only
-  - `run`           : Orchestrate plan→observe→verify/reflect loop until done
-  - `show`          : Pretty-print current plan/evidence summary
-
-Usage examples:
-  python agentic_video_framework.py plan --run-dir runs/demo --video /path/v.mp4 --query "When does the person enter the red car?"
-  python agentic_video_framework.py run --run-dir runs/demo --max-rounds 3
-  python agentic_video_framework.py show --run-dir runs/demo
+See README.md and the scripts/ directory for end-to-end evaluation wrappers.
 """
 from __future__ import annotations
 
@@ -59,9 +48,38 @@ import hashlib
 # Gemini / Vertex AI
 from google import genai
 from google.genai import types
-from google.genai.types import Part, Blob, VideoMetadata
+from google.genai.types import Part, Blob, VideoMetadata, FileData
 import os
+import time
 from pathlib import Path
+
+
+# Files <= this many bytes go inline (fast, no upload roundtrip); larger files
+# are uploaded via the Gemini File API. The inline payload caps on AI Studio
+# are ~20 MB practical / 1 GiB request / 2 GiB inline_data; 20 MB is a safe
+# headroom that keeps small region-clips fast while routing big videos through
+# the File API.
+INLINE_VIDEO_SIZE_LIMIT_BYTES = 20 * 1024 * 1024
+
+
+def _probe_video_duration_seconds(path: str) -> Optional[float]:
+    """Last-resort duration probe via OpenCV (we already depend on it).
+
+    Returns None on failure; callers must handle that.
+    """
+    try:
+        import cv2
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            return None
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+        n_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
+        cap.release()
+        if fps > 0 and n_frames > 0:
+            return float(n_frames / fps)
+    except Exception:
+        pass
+    return None
 
 # Import prompt management
 from .prompt import (
@@ -72,6 +90,7 @@ from .prompt import (
     EVIDENCE_SCHEMA,
     FINAL_ANSWER_SCHEMA,
     MCQ_SCHEMA,
+    REFLECTOR_SCHEMA,
 )
 
 # Import video utilities
@@ -369,6 +388,7 @@ class GeminiClient:
         max_frame_low: int = 512,
         max_frame_medium: int = 128,
         max_frame_high: int = 128,
+        confidence_threshold: float = 0.7,
     ):
         # Support separate models for plan/replan vs execute
         # If not specified, use the legacy 'model' parameter for both
@@ -384,8 +404,13 @@ class GeminiClient:
         self.max_frame_low = max_frame_low
         self.max_frame_medium = max_frame_medium
         self.max_frame_high = max_frame_high
+        # Confidence threshold tau_conf for the reflector (paper Sec 4.3 uses 0.7)
+        self.confidence_threshold = confidence_threshold
         self.created_clips = []  # Track clips created during execution
         self.temp_clips_dir = None  # Will be set by Controller to be unique per job/worker
+        # File-API cache: abs_path -> File object (avoid re-uploading the same
+        # video across rounds / observations).
+        self._uploaded_files: Dict[str, Any] = {}
 
     def initialize_client(self):
         """Initialize the Gemini client (API key or Vertex AI)."""
@@ -402,6 +427,75 @@ class GeminiClient:
             print(f"❌ Failed to initialize Gemini client: {e}")
             raise
     
+    # ---------- File API ----------
+    def cleanup_uploaded_files(self) -> None:
+        """Delete every video uploaded via the File API on this client.
+
+        AI Studio retains uploaded files for ~48h and enforces a per-project
+        storage quota; on multi-hundred-sample evals (each video ~100s of MB)
+        we must release them after each sample, not at the end of the run.
+        Safe to call even if no files were uploaded.
+        """
+        if self.client is None or not self._uploaded_files:
+            return
+        for path, f in list(self._uploaded_files.items()):
+            try:
+                self.client.files.delete(name=f.name)
+                if self.debug:
+                    print(f"🗑️  Deleted uploaded file: {f.name}  ({path})")
+            except Exception as e:
+                if self.debug:
+                    print(f"⚠️  Could not delete uploaded file {f.name}: {e}")
+        self._uploaded_files.clear()
+
+    def _get_or_upload_file(self, video_path: str, mime_type: str) -> Any:
+        """Upload `video_path` via the Gemini File API (or return a cached File).
+
+        Used for videos larger than INLINE_VIDEO_SIZE_LIMIT_BYTES to avoid the
+        2 GiB inline-data cap and 1 GiB request-payload cap. Polls until the
+        File reaches ACTIVE state. Cached per absolute path on the client so the
+        same video isn't re-uploaded across rounds / observations.
+        """
+        if self.client is None:
+            self.initialize_client()
+        abs_path = os.path.abspath(video_path)
+        cached = self._uploaded_files.get(abs_path)
+        if cached is not None:
+            # If a previous upload finished long ago, the File may have expired
+            # (Gemini File API retains files for ~48h). Try to refresh state;
+            # on any error, fall through and re-upload.
+            try:
+                refreshed = self.client.files.get(name=cached.name)
+                if getattr(refreshed.state, "name", "") == "ACTIVE":
+                    return refreshed
+            except Exception:
+                pass
+
+        if self.debug:
+            size_mb = os.path.getsize(abs_path) / (1024 * 1024)
+            print(f"📤 Uploading via File API: {abs_path} ({size_mb:.1f} MB)")
+        f = self.client.files.upload(file=abs_path, config={"mime_type": mime_type})
+        # Poll until ACTIVE (small videos take seconds; big ones tens of seconds).
+        deadline = time.time() + 600  # 10 min safety
+        while time.time() < deadline:
+            state = getattr(f.state, "name", str(f.state))
+            if state == "ACTIVE":
+                break
+            if state == "FAILED":
+                raise RuntimeError(f"File API upload FAILED for {abs_path}")
+            time.sleep(2)
+            try:
+                f = self.client.files.get(name=f.name)
+            except Exception:
+                # transient; keep polling
+                pass
+        else:
+            raise TimeoutError(f"File API upload did not become ACTIVE in time: {abs_path}")
+        self._uploaded_files[abs_path] = f
+        if self.debug:
+            print(f"📤 File API ready: {f.uri}")
+        return f
+
     # ---------- Video helpers ----------
     # Note: These methods now delegate to video_utils for cleaner separation
 
@@ -439,10 +533,6 @@ class GeminiClient:
         
         # Use video_utils to get MIME type
         mime_type = get_mime_type(actual_video_path)
-        
-        with open(actual_video_path, "rb") as f:
-            video_data = f.read()
-        blob = Blob(mime_type=mime_type, data=video_data)
 
         video_metadata = None
         if fps or start_offset or end_offset:
@@ -457,10 +547,10 @@ class GeminiClient:
                     max_frame = self.max_frame_high
                 else:
                     max_frame = self.max_frame_medium
-                
+
                 # Calculate duration in seconds from offsets or explicit duration
                 duration = duration_sec  # Use explicit duration if provided
-                
+
                 if duration is None or duration <= 0:
                     # Try to calculate from offsets
                     if start_offset and end_offset:
@@ -475,7 +565,7 @@ class GeminiClient:
                             duration = float(end_offset.rstrip("s"))  # Duration from start
                         except ValueError:
                             duration = None
-                
+
                 # If we still don't have duration, try to get it from video metadata
                 if duration is None or duration <= 0:
                     meta_extractor = VideoMetadataExtractor(actual_video_path)
@@ -488,23 +578,42 @@ class GeminiClient:
                             duration = video_duration
                     else:
                         duration = video_duration
-                
-                # Adjust fps if it would exceed max frame limit
-                if duration and duration > 0:
-                    expected_frames = fps * duration
-                    if expected_frames > max_frame:
-                        adjusted_fps = max_frame / duration
+
+                # Last-resort probe via OpenCV; without it, the frame clamp
+                # below is silently bypassed -> token / image-count errors.
+                if duration is None or duration <= 0:
+                    probed = _probe_video_duration_seconds(actual_video_path)
+                    if probed and probed > 0:
+                        if start_offset:
+                            try:
+                                start_sec = float(start_offset.rstrip("s"))
+                                duration = max(0.0, probed - start_sec)
+                            except ValueError:
+                                duration = probed
+                        else:
+                            duration = probed
                         if self.debug:
-                            print(f"⚠️  Adjusting FPS: {fps:.2f} -> {adjusted_fps:.2f} (max {max_frame} frames)")
-                        fps = adjusted_fps
-                
+                            print(f"📐 Probed duration via OpenCV: {duration:.1f}s")
+
+                # Always clamp: if duration is still unknown, assume a conservative
+                # worst case so we never request more frames than the API allows
+                # (10,800 image cap / 1M-token budget).
+                effective_duration = duration if (duration and duration > 0) else 1800.0
+                expected_frames = fps * effective_duration
+                if expected_frames > max_frame:
+                    adjusted_fps = max_frame / effective_duration
+                    if self.debug:
+                        src = "duration" if (duration and duration > 0) else "worst-case 1800s"
+                        print(f"⚠️  Adjusting FPS: {fps:.2f} -> {adjusted_fps:.4f} (max {max_frame} frames over {src})")
+                    fps = adjusted_fps
+
                 kwargs["fps"] = fps
-            
+
             if start_offset:
                 kwargs["startOffset"] = start_offset
             if end_offset:
                 kwargs["endOffset"] = end_offset
-            
+
             if kwargs:
                 video_metadata = VideoMetadata(**kwargs)
                 if self.debug:
@@ -514,7 +623,26 @@ class GeminiClient:
         # The media_resolution parameter is still used above for FPS adjustment calculations
         if self.debug and media_resolution:
             print(f"📹 Media resolution: {media_resolution} (will be set in GenerateContentConfig)")
-        
+
+        # Transport choice: tiny clips go inline (no upload roundtrip), bigger
+        # videos go through the Gemini File API (avoids the 2 GiB inline cap
+        # and the 1 GiB request-payload cap).
+        try:
+            file_size = os.path.getsize(actual_video_path)
+        except OSError:
+            file_size = 0
+        try:
+            if file_size > INLINE_VIDEO_SIZE_LIMIT_BYTES:
+                uploaded = self._get_or_upload_file(actual_video_path, mime_type)
+                return Part(file_data=FileData(file_uri=uploaded.uri, mime_type=mime_type),
+                            video_metadata=video_metadata)
+        except Exception as e:
+            print(f"Failed to upload video file to Gemini's temporary file storage: {e}")
+            print(f"Will use the inline data mode...")
+
+        with open(actual_video_path, "rb") as f:
+            video_data = f.read()
+        blob = Blob(mime_type=mime_type, data=video_data)
         return Part(inlineData=blob, videoMetadata=video_metadata)
 
     # ---------- Core calls ----------
@@ -526,18 +654,20 @@ class GeminiClient:
         return str(rate).strip().lower()
 
 
-    def plan(self, query: str, video_meta: Dict[str, Any] = None, prior: Optional[Blackboard] = None, options: Optional[List[str]] = None) -> PlanSpec:
+    def plan(self, query: str, video_meta: Dict[str, Any] = None, prior: Optional[Blackboard] = None, options: Optional[List[str]] = None, justification: Optional[str] = None) -> PlanSpec:
         """Generate observation action plan using LLM.
-        
+
         For initial planning: generates a single observation action based on query and video metadata.
-        For replanning: incorporates all evidence and interaction history to plan the next observation.
-        
+        For replanning: incorporates all evidence and the reflector's justification
+        to plan the next observation -- PLANNER.REPLAN(Q, H, J).
+
         Args:
             query: User's question about the video
             video_meta: Video metadata (duration, fps, etc.)
             prior: Optional prior blackboard state (for replanning - contains evidence and history)
             options: Optional list of options for MCQ questions
-            
+            justification: Reflector's justification J of what is still missing/uncertain
+
         Returns:
             PlanSpec with single observation action (query + watch config)
         """
@@ -552,9 +682,9 @@ class GeminiClient:
         
         # Generate prompt using PromptManager
         if is_replan:
-            # Replanning: include evidence summary and justification
+            # Replanning: include evidence summary and the reflector's justification
             evidence_summary = prior.summary_text()
-            prompt = PromptManager.get_replanning_prompt(query, video_meta, evidence_summary, options)
+            prompt = PromptManager.get_replanning_prompt(query, video_meta, evidence_summary, options, justification=justification)
         else:
             # Initial planning
             prompt = PromptManager.get_planning_prompt(query, video_meta, options)
@@ -786,8 +916,8 @@ class GeminiClient:
                     part = self.create_video_part(
                         video_path=video_path,
                         fps=fps,
-                        start_offset=f"{reg_start}s" if reg_start > 0 else None,
-                        end_offset=f"{reg_end}s" if reg_end > 0 else None,
+                        start_offset=f"{reg_start:.3f}s" if reg_start > 0 else None,
+                        end_offset=f"{reg_end:.3f}s" if reg_end > 0 else None,
                         media_resolution=media_res,
                     )
                     parts.append(part)
@@ -806,8 +936,8 @@ class GeminiClient:
                 part = self.create_video_part(
                     video_path=video_path,
                     fps=fps,
-                    start_offset=f"{start_sec}s" if start_sec > 0 else None,
-                    end_offset=f"{end_sec}s" if end_sec > 0 else None,
+                    start_offset=f"{start_sec:.3f}s" if start_sec > 0 else None,
+                    end_offset=f"{end_sec:.3f}s" if end_sec > 0 else None,
                     media_resolution=media_res,
                 )
                 parts = [part]
@@ -857,19 +987,21 @@ class GeminiClient:
                 part = self.create_video_part(
                     video_path=video_path,
                     fps=fps,
-                    start_offset=f"{start_sec}s" if start_sec > 0 else None,
-                    end_offset=f"{end_sec}s" if end_sec > 0 else None,
+                    start_offset=f"{start_sec:.3f}s" if start_sec > 0 else None,
+                    end_offset=f"{end_sec:.3f}s" if end_sec > 0 else None,
                     media_resolution=media_res,
                 )
                 parts = [part]
                 frames_used = [{"start": start_sec, "end": end_sec, "fps": fps}]
         else:
-            # For uniform mode, use offsets as normal
+            # For uniform mode, use offsets as normal.
+            # Cap to millisecond precision: Google's Duration proto rejects more
+            # than 9 fractional digits (~"failed to parse nano seconds" 400).
             part = self.create_video_part(
                 video_path=video_path,
                 fps=fps,
-                start_offset=f"{start_sec}s" if start_sec > 0 else None,
-                end_offset=f"{end_sec}s" if end_sec > 0 else None,
+                start_offset=f"{start_sec:.3f}s" if start_sec > 0 else None,
+                end_offset=f"{end_sec:.3f}s" if end_sec > 0 else None,
                 media_resolution=media_res,
             )
             parts = [part]
@@ -1044,9 +1176,8 @@ class GeminiClient:
             timestamp=now_iso(),
             round_id=0  # Will be set by Controller
         )
-    
-    # verify_evidence method removed - Verifier now analyzes evidence without re-watching video
-    
+
+
     def _extract_timestamps(self, text: str) -> List[float]:
         """Extract timestamps from model response text."""
         import re
@@ -1276,7 +1407,7 @@ class Planner:
     def initial_plan(self, query: str, video_meta: Dict[str, Any] = None, options: Optional[List[str]] = None) -> PlanSpec:
         """Generate initial observation action plan.
         
-        This is the "plan" phase of the plan-observe-verify framework.
+        This is the "plan" phase of the plan-observe-reflect framework.
         Creates a single observation action plan (query + watch config).
         """
         return self.client.plan(query, video_meta, options=options)
@@ -1327,16 +1458,19 @@ class Observer:
 
     def observe(self, plan: PlanSpec, bb: Blackboard) -> Evidence:
         """Observe the video segment specified by the plan and gather evidence.
-        
-        This is the "observe" phase of the plan-observe-verify framework.
+
+        This is the "observe" phase of the plan-observe-reflect framework.
         Executes the observation action and collects query-related evidence.
-        
+
+        Pure: does NOT mutate `bb`. The Controller is the sole owner of the
+        blackboard append and does so after assigning `ev.round_id`.
+
         Args:
             plan: Plan with query and watch config
-            bb: Blackboard with video path and accumulated evidence
-            
+            bb: Blackboard with video path (used for video metadata only)
+
         Returns:
-            Evidence from this observation
+            Evidence from this observation (round_id left at default 0)
         """
         # Get video metadata
         meta_extractor = VideoMetadataExtractor(bb.video_path)
@@ -1414,8 +1548,9 @@ class Observer:
                 print(f"  ... and {len(ev.key_evidence) - 5} more")
             print(f"Reasoning: {ev.reasoning[:200]}...")
             print(f"{'='*80}\n")
-        
-        bb.add_evidence(ev)
+
+        # Observer is pure: the Controller owns blackboard mutation and is the
+        # only place that appends the returned Evidence (after setting round_id).
         return ev
 
 
@@ -1471,11 +1606,12 @@ class Reflector:
             bb.add_evidence(ev)
         context_text = bb.summary_text()
         
-        # If last round, directly generate final answer using synthesis prompt
+        # Last round: REFLECTOR.FORCEANSWER(Q, E) -- force an answer from all
+        # accumulated evidence (Algorithm 1, line 10).
         if is_last_round:
             if self.client.debug:
                 print(f"\n{'='*80}")
-                print(f"🎯 LAST ROUND - GENERATING FINAL ANSWER DIRECTLY")
+                print(f"🎯 LAST ROUND - FORCEANSWER(Q, E)")
                 print(f"{'='*80}")
                 print(f"Query: {query}")
                 print(f"Evidence Count: {len(evidence_list)}")
@@ -1552,122 +1688,150 @@ class Reflector:
         
         if self.client.debug:
             print(f"\n{'='*80}")
-            print(f"🔍 VERIFIER INPUT")
+            print(f"🔍 REFLECTOR INPUT  (C, J) = REFLECTOR(Q, E)")
             print(f"{'='*80}")
             print(f"Query: {query}")
             print(f"Evidence Count: {len(evidence_list)}")
             print(f"Video: {video_path}")
             print(f"Duration: {duration_sec:.1f}s" if duration_sec else "Duration: unknown")
             print(f"{'='*80}\n")
-        
-        # Collect regions from current evidence
-        regions: List[Tuple[float, float]] = []
-        for ev in evidence_list:
-            for kev in ev.key_evidence:
-                if isinstance(kev, dict):
-                    ts_start = kev.get("timestamp_start")
-                    ts_end = kev.get("timestamp_end")
-                    if ts_start is not None and ts_end is not None:
-                        regions.append((float(ts_start), float(ts_end)))
-        
-        # Deduplicate exact duplicates
-        regions = list(set(regions))
-        
-        # Normalize to full seconds
-        if duration_sec:
-            regions = round_intervals_full_seconds(regions, duration=duration_sec)
-        
-        # Merge overlapping/adjacent regions (within 5 seconds)
-        if regions:
-            regions_sorted = sorted(regions, key=lambda x: x[0])
-            merged = []
-            for start, end in regions_sorted:
-                if not merged:
-                    merged.append([start, end])
-                else:
-                    last_start, last_end = merged[-1]
-                    if start <= last_end + 5:  # Overlap or close (within 5s)
-                        merged[-1] = [last_start, max(last_end, end)]
-                    else:
-                        merged.append([start, end])
-            regions = [(float(s), float(e)) for s, e in merged]
-        
-        # Limit to max 10 regions
-        if len(regions) > 10:
-            if self.client.debug:
-                print(f"⚠️  Limiting regions from {len(regions)} to 10")
-            regions = regions[:10]
-        
+
         if self.client.debug:
-            print(f"Total evidence items: {sum(len(ev.key_evidence) for ev in evidence_list)}")
-            print(f"Unique regions (after dedup/merge): {len(regions)}")
-            for i, (start, end) in enumerate(regions[:5], 1):
-                print(f"  {i}. [{int(start)}, {int(end)}]s")
-            if len(regions) > 5:
-                print(f"  ... and {len(regions) - 5} more")
-        
-        # If no regions, insufficient
-        if not regions:
+            total_items = sum(len(ev.key_evidence) for ev in evidence_list)
+            print(f"Cumulative evidence: {len(evidence_list)} round(s), {total_items} key-evidence item(s)")
+
+        # Confidence threshold tau_conf (paper Sec 4.3 default 0.7)
+        tau_conf = getattr(self.client, "confidence_threshold", 0.7)
+
+        # Short-circuit: with no usable evidence at all, the reflector cannot
+        # verify anything -- report low confidence and request another round.
+        has_any_evidence = any(ev.detailed_response for ev in evidence_list)
+        if not has_any_evidence:
             if self.client.debug:
-                print(f"\n⚠️  No evidence regions - insufficient")
+                print(f"\n⚠️  No evidence gathered yet - insufficient, requesting another observation")
             return {
                 "sufficient": False,
                 "should_update": True,
                 "updates": [],
-                "reasoning": "No evidence regions found; need to replan with different observation strategy.",
-                "confidence": 0.7,
-                "query_confidence": 0.2,
-                "event": "VERIFICATION"
+                "reasoning": "No evidence gathered yet; the reflector cannot verify the query.",
+                "justification": (
+                    "No usable evidence has been gathered yet. The next observation "
+                    "should scan the video to locate cues relevant to the query."
+                ),
+                "confidence": 0.5,
+                "query_confidence": 0.0,
+                "event": "REFLECTION"
             }
-        
-        # Assess sufficiency based on evidence quality (no re-watching video)
-        has_evidence = any(ev.detailed_response for ev in evidence_list)
-        
-        # Compute query confidence based on evidence completeness
-        if has_evidence:
-            # Check if evidence seems complete
-            total_evidence_items = sum(len(ev.key_evidence) for ev in evidence_list)
-            has_detailed_responses = all(ev.detailed_response for ev in evidence_list)
-            
-            # Higher confidence if we have multiple evidence items with detailed responses
-            if total_evidence_items >= 3 and has_detailed_responses:
-                query_confidence = 0.8
-            elif total_evidence_items >= 1 and has_detailed_responses:
-                query_confidence = 0.6
-            else:
-                query_confidence = 0.4
+
+        # REFLECTOR(Q, E): an LLM verifies the cumulative evidence against the
+        # query and jointly produces a confidence score and a justification.
+        options_list = options if options else []
+        prompt = PromptManager.get_reflection_prompt(
+            query=query,
+            evidence_summary=context_text,
+            video_duration=duration_sec or 0.0,
+            options=options_list,
+        )
+
+        if self.client.client is None:
+            self.client.initialize_client()
+
+        try:
+            resp = self.client.client.models.generate_content(
+                model=self.client.plan_replan_model,
+                contents=prompt
+            )
+            response_text = getattr(resp, "text", str(resp))
+            parsed = parse_json_response(response_text)
+        except Exception as e:
+            if self.client.debug:
+                print(f"⚠️  Reflector LLM call failed: {e}")
+            parsed = None
+
+        if parsed and validate_against_schema(parsed, REFLECTOR_SCHEMA):
+            try:
+                query_confidence = float(parsed.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                query_confidence = 0.0
+            query_confidence = max(0.0, min(1.0, query_confidence))
+            llm_sufficient = bool(parsed.get("sufficient", False))
+            justification = str(parsed.get("justification", "")).strip()
+            llm_reasoning = str(parsed.get("reasoning", "")).strip()
+            selected_option = str(parsed.get("selected_option", "")).strip()
+            selected_option_text = str(parsed.get("selected_option_text", "")).strip()
         else:
-            query_confidence = 0.2
-        
-        # Sufficient if confidence > 0.5
-        sufficient = query_confidence > 0.5
-        
-        # Build reasoning summary
-        reasoning = f"Evidence analysis: {len(evidence_list)} round(s), {len(regions)} unique region(s) after dedup/merge, {sum(len(ev.key_evidence) for ev in evidence_list)} total evidence items. Query confidence: {query_confidence:.2f}"
-        
-        result = {
-            "sufficient": sufficient,
-            "should_update": not sufficient,
-            "updates": [],
-            "reasoning": reasoning,
-            "confidence": 0.8,
-            "query_confidence": query_confidence,
-            "event": "VERIFICATION"
-        }
-        
+            # Robust fallback: keep the loop conservative rather than reverting
+            # to a heuristic. Low confidence -> another observation round.
+            if self.client.debug:
+                print(f"⚠️  Failed to parse reflector output; defaulting to low confidence")
+            query_confidence = 0.3
+            llm_sufficient = False
+            justification = (
+                "Reflector output could not be parsed. Treating evidence as "
+                "insufficient; the next observation should gather clearer, "
+                "query-relevant cues."
+            )
+            llm_reasoning = "Reflector output unparseable."
+            selected_option = ""
+            selected_option_text = ""
+
+        # Halting decision (paper Algorithm 1 + Table 12): C >= tau_conf.
+        # We additionally require the LLM's own `sufficient` flag (appendix
+        # prompt's primary output) to agree, so a confident-but-explicitly-
+        # insufficient reflection still triggers another observation round.
+        sufficient = (query_confidence >= tau_conf) and llm_sufficient
+
+        reasoning = (
+            f"Reflector verified {len(evidence_list)} round(s) of evidence "
+            f"against the query. sufficient={llm_sufficient}, "
+            f"confidence={query_confidence:.2f} (tau_conf={tau_conf:.2f}). "
+            f"{llm_reasoning or justification}"
+        )
+
         if self.client.debug:
             print(f"\n{'='*80}")
-            print(f"✅ VERIFIER OUTPUT")
+            print(f"✅ REFLECTOR OUTPUT")
             print(f"{'='*80}")
-            print(f"Sufficient: {result['sufficient']}")
-            print(f"Query Confidence: {result['query_confidence']:.2f}")
-            print(f"Total Evidence Items: {sum(len(ev.key_evidence) for ev in evidence_list)}")
-            print(f"Unique Regions (after dedup/merge): {len(regions)}")
-            print(f"Reasoning: {result['reasoning']}")
-            print(f"Decision: {'✅ SUFFICIENT - Generate Answer' if result['sufficient'] else '❌ INSUFFICIENT - Replan'}")
+            print(f"Sufficient (LLM): {llm_sufficient}")
+            print(f"Confidence: {query_confidence:.2f}  (tau_conf={tau_conf:.2f})")
+            print(f"Justification: {justification[:300]}")
+            print(f"Reasoning: {llm_reasoning[:300]}")
+            print(f"Decision: {'✅ SUFFICIENT - EXTRACTANSWER(J)' if sufficient else '❌ INSUFFICIENT - REPLAN(Q, H, J)'}")
             print(f"{'='*80}\n")
-        
-        return result
+
+        if sufficient:
+            # REFLECTOR.EXTRACTANSWER(J): the answer is entailed by the
+            # justification produced in the same reflection call.
+            answer_data = {
+                "selected_option": selected_option or "A",
+                "confidence": query_confidence,
+                "reasoning": justification,
+                "selected_option_text": selected_option_text or justification[:200],
+                "query_confidence": query_confidence,
+            }
+            return {
+                "sufficient": True,
+                "should_update": False,
+                "updates": [],
+                "reasoning": reasoning,
+                "confidence": query_confidence,
+                "query_confidence": query_confidence,
+                "justification": justification,
+                "event": "REFLECTION_ANSWER_EXTRACTED",
+                "final_answer": answer_data,
+            }
+
+        # Insufficient: justification J feeds the next PLANNER.REPLAN(Q, H, J).
+        return {
+            "sufficient": False,
+            "should_update": True,
+            "updates": [],
+            "reasoning": reasoning,
+            "confidence": query_confidence,
+            "query_confidence": query_confidence,
+            "justification": justification,
+            "event": "REFLECTION"
+        }
 
     # Legacy confidence/decision helpers removed in simplified loop
 
@@ -1706,6 +1870,18 @@ class Controller:
         # Use VideoMetadataExtractor to get video info (from JSON cache - only duration needed!)
         meta_extractor = VideoMetadataExtractor(self.bb.video_path)
         self.bb.duration_sec = meta_extractor.duration
+        # Fallback: probe the actual video file when the annotation cache has no
+        # usable duration. Without this, the planner / reflector / synthesis
+        # prompts all see "Video Duration: 0.0s" and the per-Part frame clamp is
+        # silently bypassed (root cause of the token / image-count 400s in our
+        # MINERVA run).
+        if not self.bb.duration_sec or self.bb.duration_sec <= 0:
+            probed = _probe_video_duration_seconds(self.bb.video_path)
+            if probed and probed > 0:
+                self.bb.duration_sec = probed
+                if self.client.debug:
+                    print(f"📐 Probed duration via OpenCV: {probed:.1f}s "
+                          f"(annotation metadata had none)")
         
         meta = {
             "video_path": self.bb.video_path,
@@ -1745,6 +1921,7 @@ class Controller:
         observer = Observer(self.client)
         ev = observer.observe(plan, self.bb)
         ev.round_id = round_id
+        self.bb.add_evidence(ev)
         # Persist evidence with interval_map for readability
         ev_dict = dataclasses.asdict(ev)
         try:
@@ -1861,25 +2038,32 @@ class Controller:
                 options=options,
             )
             
-            # Check if final answer was generated in reflection (last round)
-            if reflection.get("final_answer"):
-                final_answer_from_reflection = reflection.get("final_answer")
-                if self.client.debug:
-                    print(f"✅ Final answer generated in last round reflection.")
-                plan.complete = True
-                break
-            
+            # Record the reflector's confidence and justification BEFORE any
+            # early exit, so EXTRACTANSWER / FORCEANSWER runs still persist them.
             query_confidence = reflection.get("query_confidence")
             if query_confidence is not None:
                 self.bb.query_confidence = query_confidence
                 if self.client.debug:
                     print(f"📊 Query-level confidence: {query_confidence:.2f}")
+            justification = reflection.get("justification")
             self.store.append_history({
                 "ts": now_iso(),
-                "event": reflection.get("event", "VERIFICATION"),
+                "event": reflection.get("event", "REFLECTION"),
                 "reflection": reflection,
+                "justification": justification,
                 "query_confidence": query_confidence
             })
+
+            # Final answer produced by the reflector (EXTRACTANSWER when
+            # confident, or FORCEANSWER on the last round).
+            if reflection.get("final_answer"):
+                final_answer_from_reflection = reflection.get("final_answer")
+                if self.client.debug:
+                    print(f"✅ Final answer produced by reflector "
+                          f"({reflection.get('event', 'REFLECTION')}).")
+                plan.complete = True
+                break
+
             if reflection.get("sufficient", False):
                 if self.client.debug:
                     print(f"✅ Evidence sufficient after verification (query_confidence={query_confidence:.2f}).")
@@ -1895,7 +2079,7 @@ class Controller:
                 video_meta = {
                     "duration_sec": self.bb.duration_sec,
                 }
-                plan = self.client.plan(query, video_meta=video_meta, prior=self.bb, options=options)
+                plan = self.client.plan(query, video_meta=video_meta, prior=self.bb, options=options, justification=justification)
 
         # final answer
         if final_answer_from_reflection is not None:

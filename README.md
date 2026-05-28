@@ -76,37 +76,82 @@ ffmpeg -version
 pip install -r requirements.txt
 ```
 
-### 3. Setup Annotation Files and Config Files
+### 3. Configure backend (Google AI Studio or Vertex AI)
 
-Before running evaluation, please download the videos from original benchmark huggingface and update the video paths of the annotation file in `avp/eval_anno/` and update the Gemini API information in `avp/config.example.json`.
+Copy the template config and pick a backend:
 
-For API Keys: 
+```bash
+cp configs/config.example.json configs/my_config.json
+```
 
-**Vertex AI (default):** Set `project` and `location` in config for GCP Vertex AI.
+**Google AI Studio API key (simplest):**
 
-**API key (Google AI Studio):** Set the `GEMINI_API_KEY` environment variable (or optional `api_key` in config).
+```bash
+export GEMINI_API_KEY=your_key
+```
+
+Leave `project` empty in the config; `api_key` can stay empty since `GEMINI_API_KEY` env wins.
+
+**Vertex AI:** set `"project"` (and optionally `"location"`) in the config; leave `GEMINI_API_KEY` unset.
+
+Pick a model in the config (`model`, `plan_replan_model`, `execute_model`) — e.g. `gemini-2.5-pro` or `gemini-2.5-flash`.
+
+### 4. Prepare your annotation file
+
+The evaluator expects a JSON list of samples; each sample needs at minimum:
+
+```json
+{
+  "path": "/abs/path/to/video.mp4",
+  "question": "What happens when ...?",
+  "options": ["A. ...", "B. ...", "C. ...", "D. ..."],
+  "solution": "<answer>C</answer>"
+}
+```
+
+`solution` (`<answer>X</answer>`) or a plain `answer` field provides the gold label. Omit `options` for open-ended questions.
+
+For the benchmarks in the paper, annotation templates are shipped under `avp/eval_anno/`:
+
+| Benchmark        | Template file                       | # samples |
+|------------------|-------------------------------------|-----------|
+| MINERVA          | `avp/eval_anno/eval_minerva.json`   | 1,473     |
+| LVBench          | `avp/eval_anno/eval_lvbench.json`   | 1,549     |
+| MLVU             | `avp/eval_anno/eval_mlvu.json`      | 2,175     |
+| Video-MME (long) | `avp/eval_anno/eval_videomme.json`  | 2,700     |
+| LongVideoBench   | `avp/eval_anno/eval_lvb.json`       | 1,337     |
+
+Download the videos from each benchmark's original source and fill in the `"path"` field for each sample (the `"path"` field in the shipped templates is empty by design).
 
 ---
 ## Evaluation
 
-Set these in `avp/parrelel_run.sh` before running:
+The framework runs an iterative **plan → observe → reflect** loop (Algorithm 1 in the paper) using paper defaults `max_turns=3` (R_max) and `confidence_threshold=0.7` (τ_conf).
 
-- **ANNOTATION_FILE** – Path to your annotation JSON
-- **OUTPUT_DIR** – Directory where results will be written
-- **CONFIG_FILE** – Path to your config JSON (e.g. `config.example.json`)
-
-Optional (with defaults):
-
-- **LIMIT** – Max number of samples (omit for no limit)
-- **MAX_TURNS** – Max plan–execute cycles per sample (default: 3)
-- **NUM_WORKERS** – Number of parallel workers (default: 4)
-- **TIMEOUT** – Timeout per sample in seconds, prevent API failure (omit for no timeout, suggested to use)
-
-Example Script:
+**Quick smoke test (single process, first 10 samples):**
 
 ```bash
-bash avp/parrelel_run.sh
+scripts/run_eval.sh path/to/annotation.json runs/smoke configs/my_config.json 10
 ```
+
+**Full evaluation (parallel, recommended):**
+
+```bash
+scripts/run_eval_parallel.sh path/to/annotation.json runs/full 16 configs/my_config.json
+```
+
+Positional args: `ANN [OUT] [WORKERS] [CONFIG] [MAX_TURNS] [TAU]`. With 16 workers the full MINERVA set (~1500 samples) finishes in ~90 minutes.
+
+**Outputs:** per-worker `runs/full/shard_<i>/` directories (with per-sample plan / evidence / final answer / history), then a merged `runs/full/results.jsonl` and `runs/full/summary.json` reporting combined accuracy.
+
+**Monitor while running:**
+
+```bash
+tail -f runs/full/shard_0.log
+grep -h "Running Accuracy" runs/full/shard_*.log | tail
+```
+
+Override the Python interpreter with `AVP_PYTHON=/path/to/python` before invocation. Re-run only the errored samples with `scripts/rerun_eval_errors.sh RUN_DIR ANN` (defaults to retryable errors; pass `ALL=1` for every error).
 
 ---
 

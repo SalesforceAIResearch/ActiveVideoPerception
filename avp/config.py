@@ -49,6 +49,10 @@ class AVPConfig:
     max_frame_medium: int = 128
     max_frame_high: int = 128
 
+    # Reflector confidence threshold tau_conf (paper Sec 4.3 uses 0.7):
+    # AVP halts and extracts the answer when reflector confidence >= this value.
+    confidence_threshold: float = 0.7
+
     def __post_init__(self):
         """Initialize location as list if it's a string."""
         if isinstance(self.location, str):

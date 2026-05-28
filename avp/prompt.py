@@ -109,6 +109,45 @@ MCQ_SCHEMA = {
     "required": ["selected_option", "confidence", "reasoning"]
 }
 
+# Reflector output. Follows the appendix prompt (Sec D.1, "Reflector prompt"):
+#   sufficient (bool), justification (str), reasoning (str).
+# We additionally require `confidence` so the tau_conf threshold (Algorithm 1
+# and Table 12's confidence-threshold ablation) can gate halting.
+# When sufficient, the supported answer is carried inside the justification so
+# it can be extracted without an extra LLM call (EXTRACTANSWER(J)).
+REFLECTOR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "sufficient": {
+            "type": "boolean",
+            "description": "True iff the cumulative evidence is enough to answer the query"
+        },
+        "confidence": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0,
+            "description": "Calibrated confidence (0-1) that the evidence is sufficient; used with tau_conf to halt"
+        },
+        "justification": {
+            "type": "string",
+            "description": "If sufficient: state the direct answer (MCQ letter + brief reason, or the natural-language answer). If not sufficient: explain what information is missing/uncertain and which regions/entities/temporal spans require additional observation."
+        },
+        "reasoning": {
+            "type": "string",
+            "description": "Short paragraph summarizing why the evidence is (not) sufficient"
+        },
+        "selected_option": {
+            "type": "string",
+            "description": "MCQ only -- the supported option letter (A/B/C/...) when sufficient is true; empty otherwise"
+        },
+        "selected_option_text": {
+            "type": "string",
+            "description": "MCQ only -- full option text when sufficient is true; empty otherwise"
+        }
+    },
+    "required": ["sufficient", "confidence", "justification", "reasoning"]
+}
+
 # ======================================================
 # Prompt Templates
 # ======================================================
@@ -438,15 +477,20 @@ Analyze the video now and respond with JSON only."""
         query: str,
         video_meta: Dict[str, Any],
         evidence_summary: str,
-        options: Optional[List[str]] = None
+        options: Optional[List[str]] = None,
+        justification: Optional[str] = None
     ) -> str:
         """Generate prompt for replanning after insufficient evidence.
-        
+
+        Implements PLANNER.REPLAN(Q, H, J): the reflector's justification J
+        states what is still missing/uncertain and steers the next observation.
+
         Args:
             query: User's question about the video
             video_meta: Video metadata (duration)
             evidence_summary: Summary of all evidence gathered so far
             options: Optional list of options for MCQ questions
+            justification: Reflector's justification of what is missing/uncertain
         """
         duration = (
             video_meta.get("duration_sec")
@@ -471,10 +515,13 @@ Analyze the video now and respond with JSON only."""
 **Evidence Gathered from Previous Rounds:**
 {evidence_summary}
 
+**Reflector Feedback (what is still missing / uncertain):**
+{justification.strip() if justification else "No specific feedback; the evidence is insufficient to answer the query."}
+
 ---
 
 **Your Task:**
-Based on the evidence gathered so far and what's still missing, plan a NEW single observation action to gather additional evidence.
+Based on the evidence gathered so far and the reflector feedback above, plan a NEW single observation action that directly targets the missing or uncertain cues identified by the reflector.
 
 **Replanning Strategy:**
 1. **Analyze what's missing**: What aspects of the query are not yet answered by the evidence?
@@ -517,9 +564,123 @@ The steps array MUST contain exactly ONE item.
 ```
 
 Now generate the replan for the user's query. Respond with JSON only, no additional text."""
-        
+
         return prompt
-    
+
+    @staticmethod
+    def get_reflection_prompt(
+        query: str,
+        evidence_summary: str,
+        video_duration: float,
+        options: Optional[List[str]] = None
+    ) -> str:
+        """Generate prompt for evidence reflection: REFLECTOR(Q, E).
+
+        The reflector verifies how well the cumulative evidence supports an
+        answer to the query, producing a calibrated confidence score and a
+        justification. When confident, it also names the supported answer so it
+        can be extracted directly from the justification.
+
+        Args:
+            query: User's question about the video
+            evidence_summary: Summary of all evidence gathered so far (cumulative)
+            video_duration: Total video duration in seconds
+            options: Optional list of multiple choice options
+        """
+        options_list = options if options else []
+        if options_list:
+            options_text = "\n".join([f"  {opt}" for opt in options_list])
+            mcq_line = (
+                "- The user query includes the following MCQ options:\n"
+                f"{options_text}"
+            )
+            sufficient_answer_rule = (
+                "MCQ: state the option letter (A/B/C/...) and a brief reason. "
+                "Also fill the `selected_option` and `selected_option_text` "
+                "fields with the chosen letter and full option text."
+            )
+        else:
+            mcq_line = "- No MCQ options were provided; this is an open-ended question."
+            sufficient_answer_rule = (
+                "Open-ended: clearly state the answer in natural language inside "
+                "`justification`. Leave `selected_option` and `selected_option_text` empty."
+            )
+
+        duration_line = (
+            f"  - video_duration: {video_duration:.1f} seconds"
+            if video_duration and video_duration > 0
+            else "  - video_duration: unknown (treat as missing metadata, NOT as an empty video)"
+        )
+
+        # Prompt structure mirrors the appendix Reflector prompt (Sec D.1):
+        # Goal / Inputs / Your task / Required JSON output / Few-shot examples.
+        prompt = f"""**Reflector prompt (evidence sufficiency checker)**
+
+**Goal.** Given the original query and cumulative evidence from all observation rounds, decide whether the current evidence is sufficient to answer the query, and produce a justification that either (i) contains the final answer, or (ii) explains what is missing.
+
+**Inputs.**
+- query: original user query (with options if MCQ).
+- evidence_summary: aggregated evidence from all Observer steps.
+- video_duration: total duration in seconds.
+- options: optional list of MCQ options.
+
+**Query:** {query}
+{mcq_line}
+
+**Video metadata:**
+{duration_line}
+
+**Cumulative evidence (aggregated from all Observer steps, timestamped):**
+{evidence_summary}
+
+---
+
+**Your task.**
+- Decide a boolean `sufficient` indicating whether the evidence is enough to answer the query.
+- **If sufficient (true):** the `justification` MUST give the direct answer.
+  - {sufficient_answer_rule}
+- **If not sufficient (false):** the `justification` MUST explain what information is missing or uncertain (e.g., which regions, entities, or temporal spans require additional observation). This feedback guides the next planning round.
+- Always provide a short `reasoning` paragraph that summarizes why the evidence is (not) sufficient.
+- Also output a calibrated `confidence` in [0.0, 1.0] reflecting how strongly the evidence supports a correct answer (used together with a halting threshold tau_conf, see paper Algorithm 1 / Table 12). Calibration guideline:
+  - High (>= 0.7): the evidence clearly and unambiguously entails an answer.
+  - Medium (~0.4-0.7): the evidence is suggestive but incomplete or ambiguous.
+  - Low (< 0.4): the evidence does not address the key cues; more observation is needed.
+
+Judge sufficiency purely from the evidence's relevance to the query. Do NOT guess and do NOT assume access to the raw video. Be conservative: it is better to report low confidence and request another observation than to over-claim.
+
+**Required JSON output (LLM response):**
+{json.dumps(REFLECTOR_SCHEMA, indent=2)}
+
+**Few-shot examples.**
+
+Example (sufficient, MCQ):
+```json
+{{
+  "sufficient": true,
+  "confidence": 0.88,
+  "justification": "Option D. At [63s-69s] the Tombstone monument is visible as a small conical stone structure in the upper-left background while the German couple is introduced, directly matching the question.",
+  "reasoning": "The cumulative evidence directly identifies the on-screen position of the monument during the named scene, leaving no ambiguity among the options.",
+  "selected_option": "D",
+  "selected_option_text": "D. In the upper left background."
+}}
+```
+
+Example (not sufficient):
+```json
+{{
+  "sufficient": false,
+  "confidence": 0.30,
+  "justification": "The coarse scan localized the German woman's introduction to roughly [60s-70s] but did not capture the monument's on-screen position. Next round should re-observe [60s-70s] at higher fps/resolution focusing on the background.",
+  "reasoning": "The evidence places the relevant scene but lacks the spatial detail (background composition) required by the question; a targeted higher-resolution observation is needed.",
+  "selected_option": "",
+  "selected_option_text": ""
+}}
+```
+
+Provide your reflection now in JSON format only, no additional text."""
+
+        return prompt
+
     @staticmethod
     def get_synthesis_prompt(
         original_query: str,

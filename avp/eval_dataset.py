@@ -99,6 +99,9 @@ def evaluate_dataset(
     limit: int | None = None,
     max_turns: int = 3,
     timeout_per_sample: int | None = None,
+    confidence_threshold: float | None = None,
+    num_shards: int = 1,
+    shard_id: int = 0,
 ) -> Dict[str, Any]:
     """Run full agentic evaluation on video QA dataset.
     
@@ -116,6 +119,8 @@ def evaluate_dataset(
     # Setup
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     cfg = load_config(config_path)
+    if confidence_threshold is not None:
+        cfg.confidence_threshold = confidence_threshold
     set_metadata_source(ann_path)
     
     # Load annotations
@@ -125,7 +130,15 @@ def evaluate_dataset(
     samples = data if isinstance(data, list) else [data]
     if limit and limit > 0:
         samples = samples[:limit]
-    
+
+    # Shard striding for parallel runs: each shard takes every num_shards-th
+    # sample (modulo striding balances long/short videos across workers).
+    if num_shards > 1:
+        if not (0 <= shard_id < num_shards):
+            raise ValueError(f"shard_id must be in [0, {num_shards}), got {shard_id}")
+        samples = [s for i, s in enumerate(samples) if i % num_shards == shard_id]
+        print(f"[shard {shard_id}/{num_shards}] {len(samples)} samples assigned to this worker")
+
     print(f"Evaluating {len(samples)} samples with max_turns={max_turns}")
     print(f"Model: {cfg.model}, Project: {cfg.project}, Locations: {cfg.location} (randomly selected per sample)")
 
@@ -202,6 +215,7 @@ def evaluate_dataset(
                     max_frame_low=cfg.max_frame_low,
                     max_frame_medium=cfg.max_frame_medium,
                     max_frame_high=cfg.max_frame_high,
+                    confidence_threshold=cfg.confidence_threshold,
                     debug=cfg.debug,
                 )
                 client.initialize_client()
@@ -301,7 +315,13 @@ def evaluate_dataset(
 
             # Clean up video clips after sample evaluation (only clips created during this sample)
             cleanup_video_clips(clip_paths=controller.client.created_clips, debug=True)
-            
+            # Release any videos uploaded via the Gemini File API to keep
+            # project storage bounded across long parallel runs.
+            try:
+                controller.client.cleanup_uploaded_files()
+            except Exception as e:
+                print(f"⚠️  Could not cleanup uploaded files: {e}")
+
         except TimeoutError as e:
             print(f"TIMEOUT on sample {idx}: {e}")
             result_entry = {
@@ -326,7 +346,12 @@ def evaluate_dataset(
             except:
                 pass
             cleanup_video_clips(clip_paths=clip_paths, debug=True)
-            
+            try:
+                if 'controller' in locals() and hasattr(controller, 'client'):
+                    controller.client.cleanup_uploaded_files()
+            except Exception:
+                pass
+
         except Exception as e:
             print(f"ERROR on sample {idx}: {e}")
             result_entry = {
@@ -351,6 +376,11 @@ def evaluate_dataset(
             except:
                 pass
             cleanup_video_clips(clip_paths=clip_paths, debug=True)
+            try:
+                if 'controller' in locals() and hasattr(controller, 'client'):
+                    controller.client.cleanup_uploaded_files()
+            except Exception:
+                pass
     
     # Summary
     accuracy = correct / total if total > 0 else 0.0
@@ -386,9 +416,17 @@ def main():
     ap.add_argument("--limit", type=int, default=None, help="Evaluate first N samples")
     ap.add_argument("--max-turns", type=int, default=3, help="Max plan-execute cycles per sample")
     ap.add_argument("--timeout", type=int, default=None, help="Timeout per sample in seconds")
+    ap.add_argument("--confidence-threshold", type=float, default=None,
+                    help="Reflector confidence threshold tau_conf (paper Sec 4.3 = 0.7). Overrides config.")
+    ap.add_argument("--num-shards", type=int, default=1,
+                    help="Total number of parallel shards (workers).")
+    ap.add_argument("--shard-id", type=int, default=0,
+                    help="This worker's shard index in [0, num-shards).")
     args = ap.parse_args()
-    
-    out = evaluate_dataset(args.ann, args.out, args.config, args.limit, args.max_turns, timeout_per_sample=args.timeout)
+
+    out = evaluate_dataset(args.ann, args.out, args.config, args.limit, args.max_turns,
+                           timeout_per_sample=args.timeout, confidence_threshold=args.confidence_threshold,
+                           num_shards=args.num_shards, shard_id=args.shard_id)
     return out
 
 

@@ -1,0 +1,15 @@
+{
+  "project": "",
+  "location": ["global"],
+  "model": "gemini-2.5-flash",
+  "plan_replan_model": "gemini-2.5-flash",
+  "execute_model": "gemini-2.5-flash",
+  "api_key": "",
+  "default_media_resolution": "medium",
+  "prefer_compressed": true,
+  "debug": true,
+  "max_frame_low": 2048,
+  "max_frame_medium": 512,
+  "max_frame_high": 128,
+  "confidence_threshold": 0.7
+}

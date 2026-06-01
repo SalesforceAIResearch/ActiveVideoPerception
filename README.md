@@ -15,6 +15,10 @@
 <sup>2</sup> UNC Chapel Hill  
 <sup>*</sup> Work done during internship at Salesforce
 
+
+🎉 **Accepted as a Findings paper at CVPR 2026!** 🎉
+
+
 ---
 
 <div align="center">
